@@ -1,0 +1,1197 @@
+<html lang="en"><head>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js" integrity="sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+    <script>
+      (function() {
+        const originalConsole = window.console;
+        window.console = {
+          log: (...args) => {
+            originalConsole.log(...args);
+            window.parent.postMessage({ type: 'console', message: args.join(' ') }, '*');
+          },
+          error: (...args) => {
+            originalConsole.error(...args);
+            window.parent.postMessage({ type: 'console', message: 'Error: ' + args.join(' ') }, '*');
+          },
+          warn: (...args) => {
+            originalConsole.warn(...args);
+            window.parent.postMessage({ type: 'console', message: 'Warning: ' + args.join(' ') }, '*');
+          }
+        };
+
+        let requestId = 0;
+        let callbacksMap = new Map();
+        let streamControllers = new Map();
+        
+        window.claude = {
+          complete: (prompt) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
+            });
+          }
+        };
+
+        window.storage = {
+          get: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageGet', id, key, shared }, '*');
+            });
+          },
+          set: (key, value, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
+            });
+          },
+          delete: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
+            });
+          },
+          list: (prefix, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
+            });
+          }
+        };
+
+        let pendingBlobs = new Map();
+        URL.createObjectURL = (blob) => {
+          // Store the blob and create an ID and URL for it
+          const blobId = `blob-${Date.now()}-${Math.random()}`;
+          pendingBlobs.set(blobId, blob);
+          return `blob-request://${blobId}`;
+        };
+
+        URL.revokeObjectURL = (url) => {
+          // Remove the blob from our store
+          const blobId = url.replace("blob-request://", "");
+          pendingBlobs.delete(blobId);
+        };
+
+        const getBlobFromURL = (url) => {
+          const blobId = url.replace("blob-request://", "");
+          return pendingBlobs.get(blobId);
+        };
+
+        // Override global fetch with streaming support
+        window.fetch = (url, init = {}) => {
+          return new Promise((resolve, reject) => {
+            const id = requestId++;
+            const channelId = `fetch-${id}-${Date.now()}`;
+            
+            callbacksMap.set(id, { 
+              resolve: (response) => {
+                // Create a ReadableStream for the response body
+                const stream = new ReadableStream({
+                  start(controller) {
+                    streamControllers.set(channelId, controller);
+                  },
+                  cancel() {
+                    streamControllers.delete(channelId);
+                  }
+                });
+                
+                // Create and return the Response with the stream
+                resolve(new Response(stream, {
+                  status: response.status,
+                  statusText: response.statusText,
+                  headers: response.headers
+                }));
+              },
+              reject,
+              channelId
+            });
+            
+            window.parent.postMessage({
+              type: 'proxyFetch',
+              id,
+              url,
+              init,
+              channelId
+            }, '*');
+          });
+        };
+
+        window.addEventListener('message', async (event) => {
+          if (event.data.type === 'takeScreenshot') {
+            const rootElement = document.getElementById('artifacts-component-root-html');
+            if (!rootElement) {
+              window.parent.postMessage({
+                type: 'screenshotError',
+                error: new Error('Root element not found'),
+              }, '*');
+            }
+            const screenshot = await htmlToImage.toPng(rootElement, {
+              imagePlaceholder:
+                "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
+            });
+            window.parent.postMessage({
+              type: 'screenshotData',
+              data: screenshot,
+            }, '*');
+          } else if (event.data.type === 'claudeComplete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.completion);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'proxyFetchResponse') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+              callbacksMap.delete(event.data.id);
+            } else {
+              // Initial response with headers, status, etc.
+              callback.resolve({
+                status: event.data.status,
+                statusText: event.data.statusText,
+                headers: event.data.headers
+              });
+              // Don't delete the callback yet if streaming
+              if (!event.data.body) {
+                callbacksMap.delete(event.data.id);
+              }
+            }
+          } else if (event.data.type === 'proxyFetchStream') {
+            // Handle streaming data chunks
+            const controller = streamControllers.get(event.data.channelId);
+            if (controller) {
+              if (event.data.error) {
+                controller.error(new Error(event.data.error));
+                streamControllers.delete(event.data.channelId);
+              } else if (event.data.done) {
+                controller.close();
+                streamControllers.delete(event.data.channelId);
+                // Clean up the callback
+                const callback = Array.from(callbacksMap.entries()).find(
+                  ([_, value]) => value.channelId === event.data.channelId
+                );
+                if (callback) {
+                  callbacksMap.delete(callback[0]);
+                }
+              } else if (event.data.chunk) {
+                controller.enqueue(new Uint8Array(event.data.chunk));
+              }
+            }
+          } else if (event.data.type === 'storageGet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageSet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageDelete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageList') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          }
+        });
+
+        window.addEventListener('click', (event) => {
+          const isEl = event.target instanceof HTMLElement;
+          if (!isEl) return;
+    
+          // find ancestor links
+          const linkEl = event.target.closest("a");
+          if (!linkEl || !linkEl.href) return;
+    
+          event.preventDefault();
+          event.stopImmediatePropagation();
+    
+          if (linkEl.href.startsWith("blob-request:")) {
+            const blob = getBlobFromURL(linkEl.href);
+            if (!blob) return;
+            void blob.arrayBuffer().then((data) => {
+              window.parent.postMessage({
+                type: "downloadFile",
+                filename: linkEl.download,
+                data,
+                mimeType: blob.type || "application/octet-stream",
+              });
+            });
+          } else if (linkEl.href.startsWith("data:")) {
+            const [header, base64Data] = linkEl.href.split(",");
+            const mimeMatch = header.match(/data:([^;]+)/);
+            const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+            const binaryString = atob(base64Data);
+            const data = Uint8Array.from(binaryString, (c) =>
+              c.charCodeAt(0),
+            ).buffer;
+            window.parent.postMessage({
+              type: "downloadFile",
+              filename: linkEl.download,
+              data,
+              mimeType,
+            });
+          } else {
+            let linkUrl;
+            try {
+              linkUrl = new URL(linkEl.href);
+            } catch (error) {
+              return;
+            }
+    
+            if (linkUrl.hostname === window.location.hostname) return;
+      
+            window.parent.postMessage({
+              type: 'openExternal',
+              href: linkEl.href,
+            }, '*');
+          }
+      });
+
+        const originalOpen = window.open;
+        window.open = function (url) {
+          window.parent.postMessage({
+            type: "openExternal",
+            href: url,
+          }, "*");
+        };
+
+        window.addEventListener('error', (event) => {
+          window.parent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
+        });
+      })();
+    </script>
+  
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NEURO REACH - Investment Pitch</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            overflow-x: hidden;
+        }
+
+        .presentation-container {
+            width: 100vw;
+            height: 100vh;
+            position: relative;
+        }
+
+        .slide {
+            width: 100%;
+            height: 100%;
+            position: absolute;
+            top: 0;
+            left: 0;
+            opacity: 0;
+            transition: opacity 0.6s ease-in-out;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            padding: 60px;
+            background: white;
+        }
+
+        .slide.active {
+            opacity: 1;
+            z-index: 1;
+        }
+
+        /* Slide 1: Cover */
+        .slide-1 {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            text-align: center;
+        }
+
+        .slide-1 h1 {
+            font-size: 4.5em;
+            font-weight: 800;
+            margin-bottom: 20px;
+            text-shadow: 2px 2px 4px rgba(0,0,0,0.3);
+            animation: fadeInUp 1s ease-out;
+        }
+
+        .slide-1 .tagline {
+            font-size: 1.8em;
+            margin-bottom: 40px;
+            opacity: 0.95;
+            animation: fadeInUp 1s ease-out 0.3s both;
+        }
+
+        .slide-1 .subtitle {
+            font-size: 1.2em;
+            opacity: 0.85;
+            animation: fadeInUp 1s ease-out 0.6s both;
+        }
+
+        /* Slide 2: The Problem */
+        .slide-2 {
+            background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
+            color: white;
+        }
+
+        .problem-stats {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 40px;
+            margin-top: 50px;
+            width: 100%;
+            max-width: 1000px;
+        }
+
+        .stat-box {
+            background: rgba(255,255,255,0.2);
+            backdrop-filter: blur(10px);
+            padding: 40px;
+            border-radius: 20px;
+            text-align: center;
+            animation: scaleIn 0.6s ease-out both;
+        }
+
+        .stat-box:nth-child(1) { animation-delay: 0.2s; }
+        .stat-box:nth-child(2) { animation-delay: 0.4s; }
+        .stat-box:nth-child(3) { animation-delay: 0.6s; }
+        .stat-box:nth-child(4) { animation-delay: 0.8s; }
+
+        .stat-number {
+            font-size: 4em;
+            font-weight: 800;
+            margin-bottom: 10px;
+        }
+
+        .stat-label {
+            font-size: 1.2em;
+            opacity: 0.95;
+        }
+
+        /* Slide 3: The Solution */
+        .slide-3 {
+            background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%);
+            color: white;
+        }
+
+        .solution-grid {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 30px;
+            margin-top: 50px;
+            width: 100%;
+            max-width: 1200px;
+        }
+
+        .feature-card {
+            background: rgba(255,255,255,0.25);
+            backdrop-filter: blur(10px);
+            padding: 40px 30px;
+            border-radius: 20px;
+            text-align: center;
+            animation: fadeInUp 0.6s ease-out both;
+        }
+
+        .feature-card:nth-child(1) { animation-delay: 0.2s; }
+        .feature-card:nth-child(2) { animation-delay: 0.4s; }
+        .feature-card:nth-child(3) { animation-delay: 0.6s; }
+
+        .feature-icon {
+            font-size: 3.5em;
+            margin-bottom: 20px;
+        }
+
+        .feature-title {
+            font-size: 1.5em;
+            font-weight: 700;
+            margin-bottom: 15px;
+        }
+
+        .feature-desc {
+            font-size: 1em;
+            opacity: 0.95;
+            line-height: 1.6;
+        }
+
+        /* Slide 4: How It Works */
+        .slide-4 {
+            background: linear-gradient(135deg, #a8edea 0%, #fed6e3 100%);
+            color: #333;
+        }
+
+        .workflow {
+            display: flex;
+            justify-content: space-around;
+            align-items: center;
+            margin-top: 50px;
+            width: 100%;
+            max-width: 1400px;
+        }
+
+        .workflow-step {
+            text-align: center;
+            flex: 1;
+            padding: 20px;
+            animation: fadeInUp 0.6s ease-out both;
+        }
+
+        .workflow-step:nth-child(1) { animation-delay: 0.2s; }
+        .workflow-step:nth-child(2) { animation-delay: 0.4s; }
+        .workflow-step:nth-child(3) { animation-delay: 0.6s; }
+        .workflow-step:nth-child(4) { animation-delay: 0.8s; }
+        .workflow-step:nth-child(5) { animation-delay: 1s; }
+
+        .step-number {
+            width: 80px;
+            height: 80px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 2em;
+            font-weight: 800;
+            margin: 0 auto 20px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+        }
+
+        .step-title {
+            font-size: 1.3em;
+            font-weight: 700;
+            margin-bottom: 10px;
+            color: #667eea;
+        }
+
+        .step-desc {
+            font-size: 1em;
+            line-height: 1.5;
+            color: #555;
+        }
+
+        .arrow {
+            font-size: 3em;
+            color: #667eea;
+            opacity: 0.6;
+        }
+
+        /* Slide 5: Market Opportunity */
+        .slide-5 {
+            background: linear-gradient(135deg, #ffecd2 0%, #fcb69f 100%);
+            color: #333;
+        }
+
+        .market-grid {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 40px;
+            margin-top: 50px;
+            width: 100%;
+            max-width: 1000px;
+        }
+
+        .market-card {
+            background: white;
+            padding: 40px;
+            border-radius: 20px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.1);
+            animation: scaleIn 0.6s ease-out both;
+        }
+
+        .market-card:nth-child(1) { animation-delay: 0.2s; }
+        .market-card:nth-child(2) { animation-delay: 0.4s; }
+
+        .market-title {
+            font-size: 1.8em;
+            font-weight: 700;
+            margin-bottom: 20px;
+            color: #f5576c;
+        }
+
+        .market-value {
+            font-size: 3.5em;
+            font-weight: 800;
+            color: #667eea;
+            margin-bottom: 10px;
+        }
+
+        .market-desc {
+            font-size: 1.1em;
+            line-height: 1.6;
+            color: #555;
+        }
+
+        /* Slide 6: Competitive Advantage */
+        .slide-6 {
+            background: linear-gradient(135deg, #fa709a 0%, #fee140 100%);
+            color: white;
+        }
+
+        .advantages {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 30px;
+            margin-top: 50px;
+            width: 100%;
+            max-width: 1000px;
+        }
+
+        .advantage-item {
+            background: rgba(255,255,255,0.2);
+            backdrop-filter: blur(10px);
+            padding: 30px;
+            border-radius: 20px;
+            display: flex;
+            align-items: flex-start;
+            animation: fadeInUp 0.6s ease-out both;
+        }
+
+        .advantage-item:nth-child(1) { animation-delay: 0.2s; }
+        .advantage-item:nth-child(2) { animation-delay: 0.4s; }
+        .advantage-item:nth-child(3) { animation-delay: 0.6s; }
+        .advantage-item:nth-child(4) { animation-delay: 0.8s; }
+
+        .advantage-icon {
+            font-size: 2.5em;
+            margin-right: 20px;
+        }
+
+        .advantage-content h3 {
+            font-size: 1.5em;
+            margin-bottom: 10px;
+        }
+
+        .advantage-content p {
+            font-size: 1em;
+            opacity: 0.95;
+            line-height: 1.5;
+        }
+
+        /* Slide 7: Business Model */
+        .slide-7 {
+            background: linear-gradient(135deg, #30cfd0 0%, #330867 100%);
+            color: white;
+        }
+
+        .business-model {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 30px;
+            margin-top: 50px;
+            width: 100%;
+            max-width: 1200px;
+        }
+
+        .revenue-stream {
+            background: rgba(255,255,255,0.15);
+            backdrop-filter: blur(10px);
+            padding: 40px 30px;
+            border-radius: 20px;
+            text-align: center;
+            animation: scaleIn 0.6s ease-out both;
+        }
+
+        .revenue-stream:nth-child(1) { animation-delay: 0.2s; }
+        .revenue-stream:nth-child(2) { animation-delay: 0.4s; }
+        .revenue-stream:nth-child(3) { animation-delay: 0.6s; }
+
+        .revenue-icon {
+            font-size: 3.5em;
+            margin-bottom: 20px;
+        }
+
+        .revenue-title {
+            font-size: 1.5em;
+            font-weight: 700;
+            margin-bottom: 15px;
+        }
+
+        .revenue-desc {
+            font-size: 1em;
+            opacity: 0.95;
+            line-height: 1.6;
+        }
+
+        /* Slide 8: Traction & Roadmap */
+        .slide-8 {
+            background: linear-gradient(135deg, #ff9a9e 0%, #fecfef 100%);
+            color: #333;
+        }
+
+        .roadmap {
+            display: flex;
+            justify-content: space-around;
+            margin-top: 50px;
+            width: 100%;
+            max-width: 1400px;
+        }
+
+        .phase {
+            text-align: center;
+            flex: 1;
+            padding: 20px;
+            animation: fadeInUp 0.6s ease-out both;
+        }
+
+        .phase:nth-child(1) { animation-delay: 0.2s; }
+        .phase:nth-child(2) { animation-delay: 0.4s; }
+        .phase:nth-child(3) { animation-delay: 0.6s; }
+        .phase:nth-child(4) { animation-delay: 0.8s; }
+
+        .phase-title {
+            font-size: 1.5em;
+            font-weight: 700;
+            margin-bottom: 20px;
+            color: #f5576c;
+        }
+
+        .phase-content {
+            background: white;
+            padding: 30px;
+            border-radius: 15px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.1);
+        }
+
+        .phase-content ul {
+            list-style: none;
+            text-align: left;
+        }
+
+        .phase-content li {
+            padding: 10px 0;
+            font-size: 1em;
+            color: #555;
+            border-bottom: 1px solid #f0f0f0;
+        }
+
+        .phase-content li:last-child {
+            border-bottom: none;
+        }
+
+        .phase-content li:before {
+            content: "✓ ";
+            color: #4facfe;
+            font-weight: bold;
+            margin-right: 8px;
+        }
+
+        /* Slide 9: The Ask */
+        .slide-9 {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            text-align: center;
+        }
+
+        .ask-content {
+            max-width: 900px;
+            animation: scaleIn 0.8s ease-out;
+        }
+
+        .ask-amount {
+            font-size: 5em;
+            font-weight: 800;
+            margin: 40px 0;
+            text-shadow: 2px 2px 4px rgba(0,0,0,0.3);
+        }
+
+        .ask-details {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 30px;
+            margin-top: 50px;
+        }
+
+        .ask-item {
+            background: rgba(255,255,255,0.2);
+            backdrop-filter: blur(10px);
+            padding: 30px;
+            border-radius: 15px;
+        }
+
+        .ask-item h3 {
+            font-size: 1.5em;
+            margin-bottom: 10px;
+        }
+
+        .ask-item p {
+            font-size: 1.1em;
+            opacity: 0.95;
+        }
+
+        /* Slide 10: Closing */
+        .slide-10 {
+            background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
+            color: white;
+            text-align: center;
+        }
+
+        .closing-content {
+            max-width: 1000px;
+            animation: fadeInUp 1s ease-out;
+        }
+
+        .closing-content h1 {
+            font-size: 4em;
+            margin-bottom: 40px;
+            font-weight: 800;
+        }
+
+        .closing-content h2 {
+            font-size: 2.5em;
+            margin-bottom: 50px;
+            opacity: 0.95;
+        }
+
+        .contact-info {
+            font-size: 1.5em;
+            margin-top: 50px;
+            opacity: 0.95;
+        }
+
+        /* Common Styles */
+        h1 {
+            font-size: 3.5em;
+            font-weight: 800;
+            margin-bottom: 30px;
+        }
+
+        h2 {
+            font-size: 2em;
+            font-weight: 600;
+            margin-bottom: 20px;
+        }
+
+        .controls {
+            position: fixed;
+            bottom: 40px;
+            left: 50%;
+            transform: translateX(-50%);
+            z-index: 1000;
+            display: flex;
+            gap: 20px;
+        }
+
+        button {
+            padding: 15px 30px;
+            font-size: 1.1em;
+            background: rgba(255,255,255,0.3);
+            backdrop-filter: blur(10px);
+            border: 2px solid white;
+            color: white;
+            border-radius: 50px;
+            cursor: pointer;
+            font-weight: 600;
+            transition: all 0.3s;
+        }
+
+        button:hover {
+            background: white;
+            color: #667eea;
+            transform: translateY(-2px);
+            box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+        }
+
+        .slide-indicator {
+            position: fixed;
+            bottom: 40px;
+            right: 40px;
+            z-index: 1000;
+            color: white;
+            font-size: 1.2em;
+            font-weight: 600;
+            background: rgba(255,255,255,0.3);
+            backdrop-filter: blur(10px);
+            padding: 10px 20px;
+            border-radius: 30px;
+        }
+
+        @keyframes fadeInUp {
+            from {
+                opacity: 0;
+                transform: translateY(30px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        @keyframes scaleIn {
+            from {
+                opacity: 0;
+                transform: scale(0.8);
+            }
+            to {
+                opacity: 1;
+                transform: scale(1);
+            }
+        }
+
+        @media (max-width: 1200px) {
+            .slide {
+                padding: 40px;
+            }
+            h1 {
+                font-size: 2.5em;
+            }
+            .solution-grid,
+            .business-model {
+                grid-template-columns: 1fr;
+            }
+        }
+    </style>
+</head>
+<body id="artifacts-component-root-html" data-new-gr-c-s-check-loaded="14.1260.0" data-gr-ext-installed="">
+    <div class="presentation-container">
+        <!-- Slide 1: Cover -->
+        <div class="slide slide-1 active">
+            <h1>NEURO REACH</h1>
+            <p class="tagline">Democratizing Neuro-Rehabilitation with AI</p>
+            <p class="subtitle">SRM IST Entrepreneurship Bootcamp | Edition 9</p>
+        </div>
+
+        <!-- Slide 2: The Problem -->
+        <div class="slide slide-2">
+            <h1>The Global Crisis</h1>
+            <h2>Neurological Disorders Are Exploding</h2>
+            <div class="problem-stats">
+                <div class="stat-box">
+                    <div class="stat-number">100M+</div>
+                    <div class="stat-label">People affected globally by stroke, TBI, Parkinson's, MS</div>
+                </div>
+                <div class="stat-box">
+                    <div class="stat-number">₹3,500</div>
+                    <div class="stat-label">Average cost per therapy session in India</div>
+                </div>
+                <div class="stat-box">
+                    <div class="stat-number">70%</div>
+                    <div class="stat-label">Drop-out rate due to access &amp; cost barriers</div>
+                </div>
+                <div class="stat-box">
+                    <div class="stat-number">6 months+</div>
+                    <div class="stat-label">Wait time for specialized neuro-rehab facilities</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Slide 3: The Solution -->
+        <div class="slide slide-3">
+            <h1>Our Solution</h1>
+            <h2>AI-Powered, Portable, Affordable Neuro-Rehabilitation</h2>
+            <div class="solution-grid">
+                <div class="feature-card">
+                    <div class="feature-icon">🧠</div>
+                    <div class="feature-title">EOG Technology</div>
+                    <div class="feature-desc">Medical-grade eye movement tracking using electrooculography signals</div>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">🤖</div>
+                    <div class="feature-title">Adaptive AI</div>
+                    <div class="feature-desc">TensorFlow-powered therapy that evolves with patient progress</div>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">🎮</div>
+                    <div class="feature-title">Gamified Therapy</div>
+                    <div class="feature-desc">Engaging exercises that boost adherence to 80%+</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Slide 4: How It Works -->
+        <div class="slide slide-4">
+            <h1>How NEURO REACH Works</h1>
+            <div class="workflow">
+                <div class="workflow-step">
+                    <div class="step-number">1</div>
+                    <div class="step-title">Wear</div>
+                    <div class="step-desc">Patient wears comfortable EOG electrodes</div>
+                </div>
+                <div class="arrow">→</div>
+                <div class="workflow-step">
+                    <div class="step-number">2</div>
+                    <div class="step-title">Capture</div>
+                    <div class="step-desc">Eye movements captured in real-time</div>
+                </div>
+                <div class="arrow">→</div>
+                <div class="workflow-step">
+                    <div class="step-number">3</div>
+                    <div class="step-title">Analyze</div>
+                    <div class="step-desc">AI processes &amp; adapts exercises</div>
+                </div>
+                <div class="arrow">→</div>
+                <div class="workflow-step">
+                    <div class="step-number">4</div>
+                    <div class="step-title">Train</div>
+                    <div class="step-desc">Interactive gamified therapy sessions</div>
+                </div>
+                <div class="arrow">→</div>
+                <div class="workflow-step">
+                    <div class="step-number">5</div>
+                    <div class="step-title">Track</div>
+                    <div class="step-desc">Cloud-based progress monitoring</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Slide 5: Market Opportunity -->
+        <div class="slide slide-5">
+            <h1>Massive Market Opportunity</h1>
+            <div class="market-grid">
+                <div class="market-card">
+                    <div class="market-title">Global Market</div>
+                    <div class="market-value">$38.5B</div>
+                    <div class="market-desc">Neuro-rehabilitation market by 2030, growing at 7.2% CAGR</div>
+                </div>
+                <div class="market-card">
+                    <div class="market-title">Indian Market</div>
+                    <div class="market-value">$2.8B</div>
+                    <div class="market-desc">With 15M+ neurological patients needing rehab annually</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Slide 6: Competitive Advantage -->
+        <div class="slide slide-6">
+            <h1>Why We'll Win</h1>
+            <div class="advantages">
+                <div class="advantage-item">
+                    <div class="advantage-icon">💰</div>
+                    <div class="advantage-content">
+                        <h3>10x More Affordable</h3>
+                        <p>₹15,000 device vs ₹8-15L clinic-based systems</p>
+                    </div>
+                </div>
+                <div class="advantage-item">
+                    <div class="advantage-icon">🏠</div>
+                    <div class="advantage-content">
+                        <h3>Home-Based Care</h3>
+                        <p>No travel, no waiting rooms, rehab on your schedule</p>
+                    </div>
+                </div>
+                <div class="advantage-item">
+                    <div class="advantage-icon">🔒</div>
+                    <div class="advantage-content">
+                        <h3>Privacy-First</h3>
+                        <p>No cameras, only electrical signals—complete privacy</p>
+                    </div>
+                </div>
+                <div class="advantage-item">
+                    <div class="advantage-icon">📊</div>
+                    <div class="advantage-content">
+                        <h3>Data-Driven</h3>
+                        <p>Real-time analytics for patients &amp; therapists</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Slide 7: Business Model -->
+        <div class="slide slide-7">
+            <h1>Revenue Streams</h1>
+            <div class="business-model">
+                <div class="revenue-stream">
+                    <div class="revenue-icon">🛒</div>
+                    <div class="revenue-title">B2C Sales</div>
+                    <div class="revenue-desc">Direct device sales to patients: ₹15,000 per unit with ₹8,000 margin</div>
+                </div>
+                <div class="revenue-stream">
+                    <div class="revenue-icon">🏥</div>
+                    <div class="revenue-title">B2B Partnerships</div>
+                    <div class="revenue-desc">Hospital &amp; clinic partnerships: bulk orders + subscription analytics</div>
+                </div>
+                <div class="revenue-stream">
+                    <div class="revenue-icon">💳</div>
+                    <div class="revenue-title">SaaS Platform</div>
+                    <div class="revenue-desc">Cloud therapy platform: ₹499/month subscription for premium features</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Slide 8: Traction & Roadmap -->
+        <div class="slide slide-8">
+            <h1>Our Roadmap to Success</h1>
+            <div class="roadmap">
+                <div class="phase">
+                    <div class="phase-title">Q1 2026</div>
+                    <div class="phase-content">
+                        <ul>
+                            <li>Prototype completion</li>
+                            <li>Clinical validation</li>
+                            <li>Regulatory approvals</li>
+                        </ul>
+                    </div>
+                </div>
+                <div class="phase">
+                    <div class="phase-title">Q2-Q3 2026</div>
+                    <div class="phase-content">
+                        <ul>
+                            <li>Pilot with 50 patients</li>
+                            <li>Hospital partnerships</li>
+                            <li>Manufacturing setup</li>
+                        </ul>
+                    </div>
+                </div>
+                <div class="phase">
+                    <div class="phase-title">Q4 2026</div>
+                    <div class="phase-content">
+                        <ul>
+                            <li>Market launch</li>
+                            <li>500 units sold</li>
+                            <li>Break-even</li>
+                        </ul>
+                    </div>
+                </div>
+                <div class="phase">
+                    <div class="phase-title">2027</div>
+                    <div class="phase-content">
+                        <ul>
+                            <li>Scale to 5,000 units</li>
+                            <li>International expansion</li>
+                            <li>Series A funding</li>
+                        </ul>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Slide 9: The Ask -->
+        <div class="slide slide-9">
+            <div class="ask-content">
+                <h1>The Ask</h1>
+                <div class="ask-amount">₹50 Lakhs</div>
+                <h2>For 15% Equity</h2>
+                <div class="ask-details">
+                    <div class="ask-item">
+                        <h3>₹20L</h3>
+                        <p>Manufacturing &amp; Certification</p>
+                    </div>
+                    <div class="ask-item">
+                        <h3>₹15L</h3>
+                        <p>Clinical Trials &amp; Validation</p>
+                    </div>
+                    <div class="ask-item">
+                        <h3>₹15L</h3>
+                        <p>Marketing &amp; Team Expansion</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Slide 10: Closing -->
+        <div class="slide slide-10">
+            <div class="closing-content">
+                <h1>Join Us in Transforming Lives</h1>
+                <h2>Making Neuro-Rehabilitation Accessible to Millions</h2>
+                <p style="font-size: 1.5em; margin-top: 50px;">Together, we can turn disability into ability.</p>
+                <div class="contact-info">
+                    <p>Let's build the future of healthcare.</p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="controls">
+        <button onclick="previousSlide()">← Previous</button>
+        <button onclick="nextSlide()">Next →</button>
+        <button onclick="downloadPresentation()" style="background: rgba(34, 197, 94, 0.3);">📥 Download</button>
+    </div>
+
+    <div class="slide-indicator">
+        <span id="current-slide">1</span> / 10
+    </div>
+
+    <script>
+        let currentSlide = 0;
+        const slides = document.querySelectorAll('.slide');
+        const totalSlides = slides.length;
+
+        function showSlide(n) {
+            slides[currentSlide].classList.remove('active');
+            currentSlide = (n + totalSlides) % totalSlides;
+            slides[currentSlide].classList.add('active');
+            document.getElementById('current-slide').textContent = currentSlide + 1;
+        }
+
+        function nextSlide() {
+            showSlide(currentSlide + 1);
+        }
+
+        function previousSlide() {
+            showSlide(currentSlide - 1);
+        }
+
+        // Keyboard navigation
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'ArrowRight' || e.key === ' ') {
+                nextSlide();
+            } else if (e.key === 'ArrowLeft') {
+                previousSlide();
+            }
+        });
+
+        // Touch/swipe support for mobile
+        let touchStartX = 0;
+        let touchEndX = 0;
+
+        document.addEventListener('touchstart', (e) => {
+            touchStartX = e.changedTouches[0].screenX;
+        });
+
+        document.addEventListener('touchend', (e) => {
+            touchEndX = e.changedTouches[0].screenX;
+            handleSwipe();
+        });
+
+        function handleSwipe() {
+            if (touchEndX < touchStartX - 50) {
+                nextSlide();
+            }
+            if (touchEndX > touchStartX + 50) {
+                previousSlide();
+            }
+        }
+
+        function downloadPresentation() {
+            const htmlContent = document.documentElement.outerHTML;
+            const blob = new Blob([htmlContent], { type: 'text/html' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = 'NEURO-REACH-Pitch-Presentation.html';
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+        }
+    </script>
+
+</body><chatgpt-sidebar data-gpts-theme="light"></chatgpt-sidebar><grammarly-desktop-integration data-grammarly-shadow-root="true"></grammarly-desktop-integration></html>
